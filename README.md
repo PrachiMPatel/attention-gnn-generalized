@@ -186,4 +186,3 @@ this for any published work:
 
 Records were normalised into the JSONL schema documented above; original
 prompts/responses were not modified beyond field renaming.
-# attention-gnn-generalized

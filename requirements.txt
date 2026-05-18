@@ -1,0 +1,12 @@
+torch>=2.1
+transformers>=4.41
+huggingface_hub>=0.23
+scikit-learn>=1.3
+numpy>=1.24
+pandas>=2.0
+tqdm>=4.65
+matplotlib>=3.7
+ipykernel>=6.25
+# torch_geometric must be installed AFTER torch and may need a CUDA-specific
+# wheel. See README ("Install") and https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+torch_geometric>=2.5
