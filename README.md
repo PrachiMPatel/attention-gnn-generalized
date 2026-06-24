@@ -8,6 +8,17 @@ classification + linear probe over the LLM's softmax) are reported alongside.
 
 Everything happens in one notebook: [`main.ipynb`](main.ipynb).
 
+A second notebook, [`wits_main.ipynb`](wits_main.ipynb), reuses the same
+pipeline for **4-class shell-command safety classification** (WITS
+verdicts: `safe` / `maybe_safe` / `unsafe` / `extremely_unsafe`). See
+[*WITS 4-class classifier*](#wits-4-class-classifier) below.
+
+A third notebook, [`wits_binary_main.ipynb`](wits_binary_main.ipynb),
+collapses the 4 classes to **2 (`auto_approve` / `block`)** and reports
+the production gate metrics (FPR / FNR) the old WITS eval uses. The
+collapse is rule-based, not blanket — see
+[*WITS binary-gate classifier*](#wits-binary-gate-classifier).
+
 ---
 
 ## Layout
@@ -186,3 +197,170 @@ this for any published work:
 
 Records were normalised into the JSONL schema documented above; original
 prompts/responses were not modified beyond field renaming.
+
+---
+
+## WITS 4-class classifier
+
+`wits_main.ipynb` is a sister notebook that applies the same
+attention-graph + GATv2 GNN pipeline to a different task: predict the
+**WITS verdict** of a shell command — one of
+`safe` / `maybe_safe` / `unsafe` / `extremely_unsafe`.
+
+### Dataset
+
+`data/wits_eval_cases.jsonl` is the merged training corpus. It's
+assembled by `data/extract_wits_cases.py` from two source repos plus
+three curated companion files (each built by its own script):
+
+- `C:/dev/copilot-agent-runtime-final/test/hooks/auto-approve/wits/**/*.test.ts`
+- `C:/dev/what-in-the-shell-fresh/tests/**/*.test.ts`
+- `data/wits_eval_cases_reviewer.jsonl` — built by
+  `data/build_reviewer_cases.py`. Phase-1 hand-curated cases derived
+  from the WITS code review thread on "over-broad `KNOWN_SAFE`
+  allowlisting" (env-prefix RCE, `git -c` config injection, `find
+  -exec` escape hatches, etc.) plus Phase-2 programmatic augmentation
+  and Phase-3 hard negatives.
+- `data/wits_eval_cases_gap_fill.jsonl` — built by
+  `data/build_gap_fill_cases.py`. Phase-4 audit-driven fill: missing
+  PowerShell attacks, `extremely_unsafe` diversity (disk destruction,
+  fork bomb, reverse shells), missing families (kubectl delete,
+  docker `--privileged`, ssh/scp remote, base64-pipe-to-shell, git
+  force-push, persistence / evasion), plus long but inert commands
+  to defeat length-shortcut learning.
+- `data/wits_eval_cases_agent_gating.jsonl` — built by
+  `data/build_agent_gating_cases.py`. Phase-5 agent-gating
+  hardening:
+    - **5a** — agent-specific attack surface: cloud-metadata SSRF
+      (`http://169.254.169.254/...`), `/proc/self/environ` reads,
+      cloud-cred env exfil, `.vscode/tasks.json` / `.devcontainer`
+      confused-deputy writes, `.env` / `.npmrc` / `.kube/config`
+      secret reads, GitHub Actions workflow writes, untrusted
+      `./script.sh` execution.
+    - **5b** — common agent-workflow `safe` commands the corpus
+      was missing (pytest, vitest, eslint, ruff, mypy, cargo, go
+      test, docker images, kubectl logs, …) so the agent doesn't
+      pop a permission prompt for every normal action.
+    - **5c** / **5e** — argv0 contrastive rebalance: extra plain
+      `curl GET`, `cat README.md`, `echo "..."`, `find -name`,
+      `awk` reads so the GNN can't collapse "curl→unsafe" etc.
+    - **5d** — label cleanups (bare `pip install`, `docker run
+      alpine` baselines).
+- `data/wits_eval_cases_diversity.jsonl` — built by
+  `data/build_diversity_polish.py`. Phase-6 ML-correctness polish
+  in response to `data/_audit_ml.py` findings:
+    - **6a** — payload diversification: rewrites every attack
+      template (env-prefix RCE, `git -c key=val`, `/etc/...`
+      redirects, network attacks) with plausible-looking domains
+      and paths (`updates.acmecorp.io`, `/opt/instrumented/libhook.so`,
+      `/etc/cron.d/sync-job`, `bastion-prod-01.acmecorp.io`) so the
+      GNN cannot just memorise the literal string `evil` or
+      `evil.example`.
+    - **6b** — `maybe_safe` Schelling-point expansion: 5-rec
+      coverage of each gating-critical archetype (git push to
+      `feature/...`, terraform plan/apply, kubectl apply, helm
+      install/upgrade, make install/deploy, `chmod +x ./script.sh`,
+      git rebase/merge --squash, in-repo file moves, docker build).
+    - **6c** — BENIGN env-prefix cases (`NODE_OPTIONS=...`,
+      `RUST_BACKTRACE=1`, `DEBUG=...`, `JAVA_OPTS=...`, `TZ=UTC`)
+      so the model learns dangerous-env-var-name discrimination
+      rather than collapsing every `VAR=value cmd` to `unsafe`.
+    - **6d** — contrastive examples for tokens that were 100 %
+      predictive of unsafe (`ssh -V`, `git fetch`, `cat /etc/os-release`,
+      `systemctl --version`, `grep -r DELETE`).
+
+The extractor dedupes by `(command, shell)`; on a tie each subsequent
+source **overwrites** the previous one (raw tests → reviewer →
+gap-fill → agent-gating → diversity). This way the curated relabels
+stick.
+
+Final merged corpus is **~1245 cases**.
+
+Class distribution (after all six phases):
+
+| label              | count | share |
+| ---                | ---   | ---   |
+| `safe`             | 680 | 55% |
+| `unsafe`           | 272 | 22% |
+| `maybe_safe`       | 226 | 18% |
+| `extremely_unsafe` | 67  | 5%  |
+
+PowerShell coverage is 120 cases across all four classes (was
+51 safe / 0-rest before any enrichment).
+
+Agent-context attack surface (post Phase-5):
+
+| surface | rows |
+|---|---|
+| Cloud metadata SSRF (AWS / Azure / GCP) | 9 unsafe + ext |
+| `/proc/self/environ` reads | 4 unsafe |
+| `.vscode/tasks.json` / `.devcontainer/` writes | 5 unsafe |
+| `.env` / `.kube/config` / `.npmrc` secret reads | 8 unsafe |
+| GitHub Actions workflow writes | 3 unsafe + 1 typosquatted-action |
+| Untrusted `./script.sh` execution | 6 unsafe/maybe + 18 safe (contrast) |
+
+(For comparison: before Phase-5 every cell above was zero.)
+
+Adversarial robustness (post Phase-6):
+
+| metric | before P6 | after P6 |
+|---|---|---|
+| env-prefix payload diversity | 10 literal strings | 21 distinct |
+| benign env-prefix examples | 0 | 22 (17 safe + 5 borderline) |
+| `maybe_safe` Schelling archetypes ≥ 3 rows | 2/14 | 11/14 |
+| smallest test-class size | 17 | 17 |
+
+### Per-line schema
+
+```json
+{"command":"git status","shell":"bash","verdict":"safe","source":"car:test/hooks/auto-approve/wits/domains/git"}
+{"command":"rm -rf /","shell":"bash","verdict":"extremely_unsafe","source":"car:test/hooks/auto-approve/wits/domains/passes-and-chains"}
+```
+
+| field     | type   | required | description |
+| ---       | ---    | ---      | ---         |
+| `command` | str    | yes      | the raw shell command being classified |
+| `shell`   | str    | yes      | `bash` or `powershell` |
+| `verdict` | str    | yes      | one of `safe` / `maybe_safe` / `unsafe` / `extremely_unsafe` |
+| `source`  | str    | no       | provenance tag (`<repo>:<path-without-suffix>`) |
+
+### Pipeline differences vs. `main.ipynb`
+
+| aspect               | `main.ipynb`                     | `wits_main.ipynb`                           |
+| ---                  | ---                              | ---                                         |
+| input                | tool-call + tool-response        | a single shell command string               |
+| #classes             | 2 (clean / injected)             | 4 (safe / maybe_safe / unsafe / extremely_unsafe) |
+| graph                | 3 nodes, 3 edges                 | 5 nodes (4 class anchors + command), 5 edges|
+| LLM env var          | `TOOLCALL_MODEL_NAME`            | `WITS_MODEL_NAME`                           |
+| dataset path         | `data/sample_eval_cases.jsonl`   | `data/wits_eval_cases.jsonl`                |
+| extra training step  | —                                | optional class-weighted retrain (section 7b)|
+
+### Regenerate the dataset
+
+```powershell
+# 1. Regenerate the reviewer-curated companion file (Phases 1-3).
+python data/build_reviewer_cases.py
+
+# 2. Regenerate the audit-driven gap-fill companion file (Phase 4).
+python data/build_gap_fill_cases.py
+
+# 3. Regenerate the agent-gating companion file (Phase 5).
+python data/build_agent_gating_cases.py
+
+# 4. Regenerate the diversity-polish companion file (Phase 6).
+python data/build_diversity_polish.py
+
+# 5. Merge everything into the final JSONL.
+python data/extract_wits_cases.py
+
+# 6. (Optional) Re-audit the result.
+python data/_audit_dataset.py        # general gap audit
+python data/_audit_gating.py         # agent-gating-focused audit
+python data/_audit_ml.py             # ML-failure-mode audit (token leakage, payload diversity)
+```
+
+To add cases manually, edit the curated lists in the matching builder
+(`build_reviewer_cases.py`, `build_gap_fill_cases.py`,
+`build_agent_gating_cases.py`, or `build_diversity_polish.py`) and
+re-run that builder + the extractor. The notebook itself does not need
+to change.
