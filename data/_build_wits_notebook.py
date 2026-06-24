@@ -819,7 +819,7 @@ cells.append(code("""
 
     from sklearn.linear_model import LogisticRegression
     clf = LogisticRegression(max_iter=2000, C=1.0, n_jobs=-1,
-                             class_weight="balanced", multi_class="auto")
+                             class_weight="balanced")
     clf.fit(sm_tr, y_tr)
     lin_pred = clf.predict(sm_te)
     print("\\nLinear probe (softmax, class-weighted) test metrics:")
@@ -1128,8 +1128,8 @@ cells.append(code("""
             skipped += 1
             continue
         aligned_y_true.append(m.get("verdict") or ID2LABEL[m["label"]])
-        aligned_wits_pred.append(w.get("verdict") or "(error)")
-        aligned_wits_lat.append(float(w.get("elapsed_ms") or 0.0))
+        aligned_wits_pred.append(w.get("wits_verdict") or "(error)")
+        aligned_wits_lat.append(float(w.get("wits_elapsed_ms") or 0.0))
         aligned_records.append(full)
     if skipped:
         print(f"WARNING: {skipped} test_meta rows had no matching WITS prediction "
@@ -1251,7 +1251,7 @@ cells.append(code("""
         gnn = gnn_w_pred_aligned.get(key)
         if gnn is None:
             continue
-        wits = (by_key.get(key) or {}).get("verdict")
+        wits = (by_key.get(key) or {}).get("wits_verdict")
         truth = t.get("verdict")
         if gnn != wits:
             diffs.append({
