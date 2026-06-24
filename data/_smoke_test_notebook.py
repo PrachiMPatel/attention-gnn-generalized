@@ -105,6 +105,7 @@ def main() -> int:
     _check_notebook(REPO / "wits_main.ipynb")
     _check_notebook(REPO / "wits_binary_main.ipynb")
     _check_notebook(REPO / "wits_transcript_main.ipynb")
+    _check_notebook(REPO / "pipeline_eval_main.ipynb")
     print("all code cells in both notebooks parse as valid Python")
 
     recs4 = _check_4class_dataset()
