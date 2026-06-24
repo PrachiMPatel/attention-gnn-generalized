@@ -137,7 +137,7 @@ cells.append(code("""
 
     TEST_META_PATH  = DATA_DIR / f"test_meta_{TAG}.pkl"
     TEST_EXTRA_PATH = DATA_DIR / f"test_extras_{TAG}.pkl"
-    GNN_MODEL_DIR   = DATA_DIR / f"gnn_model_{TAG}"
+    GNN_MODEL_DIR   = DATA_DIR / f"gnn_weighted_{TAG}" if (DATA_DIR / f"gnn_weighted_{TAG}").exists() else DATA_DIR / f"gnn_model_{TAG}"
 
     with open(TEST_GRAPHS_PATH, "rb") as f:
         test_graphs = pickle.load(f)
