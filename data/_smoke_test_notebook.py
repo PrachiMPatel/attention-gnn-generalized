@@ -104,6 +104,7 @@ def _split_check(records: list[dict], label_key: str, label_names: list[str]) ->
 def main() -> int:
     _check_notebook(REPO / "wits_main.ipynb")
     _check_notebook(REPO / "wits_binary_main.ipynb")
+    _check_notebook(REPO / "wits_transcript_main.ipynb")
     print("all code cells in both notebooks parse as valid Python")
 
     recs4 = _check_4class_dataset()
@@ -112,6 +113,21 @@ def main() -> int:
 
     recs2 = _check_binary_dataset()
     _split_check(recs2, "binary_verdict", ["auto_approve", "block"])
+
+    # D3 transcript dataset (binary, no verdict field).
+    d3_path = REPO / "data" / "d3_transcript_cases.jsonl"
+    if d3_path.exists():
+        d3 = [json.loads(l) for l in d3_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        bad = [r for r in d3 if r.get("decision") not in ("allow", "block")]
+        if bad:
+            raise SystemExit(f"D3 has {len(bad)} rows with non-binary decision")
+        from collections import Counter
+        print(f"\nD3 transcript dataset OK: {len(d3)} valid records")
+        print("  by decision :", dict(Counter(r["decision"] for r in d3)))
+        print("  by split    :", dict(Counter(r["split"] for r in d3)))
+        print("  by shell    :", dict(Counter(r["shell"] for r in d3)))
+    else:
+        print(f"\n(skipping D3 check — {d3_path.name} not generated yet)")
 
     print("\nSmoke test OK.")
     return 0
