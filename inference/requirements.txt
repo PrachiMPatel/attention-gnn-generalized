@@ -1,0 +1,6 @@
+# Locked to the versions the GNN was trained and validated against.
+# Newer torch / torch_geometric should work but have not been verified.
+torch>=2.2,<2.5
+torch-geometric>=2.5,<2.7
+transformers>=4.40,<4.46
+numpy>=1.24,<2.1

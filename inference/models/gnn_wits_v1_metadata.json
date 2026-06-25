@@ -1,0 +1,1 @@
+{"hidden_channel_dimensions": [896, 128, 64], "num_classes": 4, "class_weights": [1.0, 3.0, 2.5, 10.19999885559082], "best_macro_f1": 0.7851843771792669}

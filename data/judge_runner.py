@@ -209,8 +209,11 @@ class _JudgeCache:
 
     def put(self, key: str, entry: _CacheEntry):
         self._load()
-        if key in self._mem:
-            return
+        # Always update the in-memory entry (later writers win); we
+        # also re-append to the JSONL so the latest result is the one
+        # encountered on a future cold load (jsonl readers honor
+        # last-write-wins because we walk the file in order and
+        # overwrite into the dict).
         self._mem[key] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a", encoding="utf-8", newline="\n") as f:
@@ -320,12 +323,15 @@ class JudgeResult:
 
 class JudgeRunner:
     def __init__(self, model: str = "claude-sonnet-4.6", *,
-                 max_tokens: int = 512, temperature: float = 0.0,
-                 use_cache: bool = True):
+                 max_tokens: int = 1024, temperature: float = 0.0,
+                 use_cache: bool = True, max_retries: int = 3,
+                 retry_backoff_s: float = 2.0):
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.use_cache = use_cache
+        self.max_retries = max_retries
+        self.retry_backoff_s = retry_backoff_s
 
     def judge(self, *, command: str, intention: str = "",
               transcript: str = "", analysis: dict | None = None) -> JudgeResult:
@@ -335,47 +341,66 @@ class JudgeRunner:
             transcript=transcript, analysis=analysis,
         )
         key = _cache_key(self.model, system, user)
+        # On a hit we still re-validate: if the cached text is empty or
+        # unparseable, treat it as a stale failure and try again. This
+        # heals the corpus from the pre-retry CAPI-flake population
+        # without invalidating the entire cache.
         if self.use_cache:
             hit = _CACHE.get(key)
-            if hit is not None:
+            if hit is not None and hit.text.strip():
                 try:
                     dec, rat = parse_judge_response(hit.text)
                     return JudgeResult(
                         decision=dec, rationale=rat, raw_text=hit.text,
                         cached=True, latency_ms=hit.latency_ms, usage=hit.usage,
                     )
-                except JudgeParseError as pe:
+                except JudgeParseError:
+                    pass  # fall through to a fresh call
+        # Fresh call with retries.
+        last_err: str | None = None
+        last_text = ""
+        last_usage: dict = {}
+        last_latency = 0.0
+        for attempt in range(self.max_retries + 1):
+            t0 = time.perf_counter()
+            try:
+                resp = _call_capi_sonnet(
+                    self.model, system, user,
+                    max_tokens=self.max_tokens, temperature=self.temperature,
+                )
+                last_latency = (time.perf_counter() - t0) * 1000.0
+                last_text = resp["choices"][0]["message"]["content"] or ""
+                last_usage = resp.get("usage") or {}
+            except Exception as e:
+                last_latency = (time.perf_counter() - t0) * 1000.0
+                last_err = f"{type(e).__name__}: {e}"
+                last_text = ""
+            # Empty -> retry. Unparseable -> retry once with same prompt
+            # (sometimes a model finishes mid-thought; a fresh sample
+            # tends to recover).
+            if last_text.strip():
+                try:
+                    dec, rat = parse_judge_response(last_text)
+                    if self.use_cache:
+                        _CACHE.put(key, _CacheEntry(text=last_text, usage=last_usage, latency_ms=last_latency))
                     return JudgeResult(
-                        decision="block", rationale=f"parse_failed: {pe}",
-                        raw_text=hit.text, cached=True,
-                        latency_ms=hit.latency_ms, usage=hit.usage,
-                        parse_error=str(pe),
+                        decision=dec, rationale=rat, raw_text=last_text,
+                        cached=False, latency_ms=last_latency, usage=last_usage,
                     )
-        t0 = time.perf_counter()
-        resp = _call_capi_sonnet(
-            self.model, system, user,
-            max_tokens=self.max_tokens, temperature=self.temperature,
-        )
-        latency = (time.perf_counter() - t0) * 1000.0
-        try:
-            text = resp["choices"][0]["message"]["content"]
-        except Exception:
-            text = json.dumps(resp)
-        usage = resp.get("usage") or {}
+                except JudgeParseError as pe:
+                    last_err = str(pe)
+            if attempt < self.max_retries:
+                time.sleep(self.retry_backoff_s * (2 ** attempt))
+        # All retries exhausted. Cache the (still-bad) final response so
+        # diagnostics can find it, but fail-closed to block.
         if self.use_cache:
-            _CACHE.put(key, _CacheEntry(text=text, usage=usage, latency_ms=latency))
-        try:
-            dec, rat = parse_judge_response(text)
-            return JudgeResult(
-                decision=dec, rationale=rat, raw_text=text,
-                cached=False, latency_ms=latency, usage=usage,
-            )
-        except JudgeParseError as pe:
-            return JudgeResult(
-                decision="block", rationale=f"parse_failed: {pe}",
-                raw_text=text, cached=False, latency_ms=latency,
-                usage=usage, parse_error=str(pe),
-            )
+            _CACHE.put(key, _CacheEntry(text=last_text, usage=last_usage, latency_ms=last_latency))
+        return JudgeResult(
+            decision="block",
+            rationale=f"all {self.max_retries+1} attempts failed or returned empty/unparseable; last_err={last_err}",
+            raw_text=last_text, cached=False, latency_ms=last_latency,
+            usage=last_usage, parse_error=last_err,
+        )
 
 
 # ============================================================================

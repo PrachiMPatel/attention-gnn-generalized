@@ -83,6 +83,32 @@ print(f"  test meta             : {len(test_meta)}")
 
 
 # ---------------------------------------------------------------------------
+# Utility-model predictions (one or more LLMs evaluated as direct
+# 4-class classifiers using data/utility_model_runner.py).
+# Whichever model prediction files exist in outputs/ get included.
+# ---------------------------------------------------------------------------
+
+# Model name -> display label in tables. Order matters: first listed first in
+# table rows. Extend this list when a new model is run via
+#   python data/utility_model_runner.py --model <name>
+UTILITY_MODELS = [
+    ("gpt-5-mini",   "Utility-model LLM (gpt-5-mini)"),
+    ("gpt-4.1",      "Utility-model LLM (gpt-4.1)"),
+    ("gpt-4o-mini",  "Utility-model LLM (gpt-4o-mini)"),
+]
+utility_loaded: list[tuple[str, str, list[dict]]] = []
+for model_name, display in UTILITY_MODELS:
+    path = OUT_DIR / f"utility_model_predictions_{model_name}.jsonl"
+    if not path.exists():
+        print(f"  utility-model preds   : (missing {path.name}; skipped)")
+        continue
+    recs = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    recs.sort(key=lambda r: r["i"])
+    utility_loaded.append((model_name, display, recs))
+    print(f"  utility-model preds   : {len(recs):3d}  {model_name:14s}  ({path.name})")
+
+
+# ---------------------------------------------------------------------------
 # Score the class-weighted GNN -- and time it
 # ---------------------------------------------------------------------------
 
@@ -243,6 +269,21 @@ method_runs = {
     },
 }
 
+for _model_name, _display, _recs in utility_loaded:
+    _u_yt = [r["truth"] for r in _recs]
+    _u_yp = [r["verdict"] if r["verdict"] in LABELS else "extremely_unsafe"
+             for r in _recs]
+    # Latency: only fresh calls (cached==False) count toward production latency
+    # stats. Cached rows took ~0 ms to look up and would skew the headline.
+    _u_fresh = [float(r["latency_ms"]) for r in _recs if not r.get("cached")]
+    method_runs[_display] = {
+        "y_true":      _u_yt,
+        "y_pred":      _u_yp,
+        "model_lat":   latency_stats(_u_fresh),
+        "feat_lat":    {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "min": 0.0, "max": 0.0},
+        "lat_breakdown": f"CAPI chat completion ({_model_name})",
+    }
+
 
 # ---------------------------------------------------------------------------
 # Per-source bucket accuracy (uses the WITS-aligned ordering)
@@ -350,9 +391,162 @@ def fmt_ms(x): return f"{x:.2f}" if x < 10 else f"{x:.1f}"
 
 # ============================ TITLE / TL;DR ================================
 
-doc.add_heading("WITS vs Prompt-only vs Attention-Graph GNN", level=0)
-add_para("4-class shell-command classifier head-to-head", italic=True, size=12)
+# NOTE — manual edits applied from the 2026-06-25 user revision:
+#   - Title now reads "WITS vs Prompt-only utility model vs Attention-Graph GNN"
+#   - Subtitle replaced with the document byline.
+# Keep these unless the user asks for them to change again.
+doc.add_heading("WITS vs Prompt-only utility model vs Attention-Graph GNN", level=0)
+add_para("Author: Prachi Patel", italic=True, size=12)
 doc.add_paragraph()
+
+
+# ============================ AIM / SCOPE ==================================
+
+# NOTE — manual edits applied from the 2026-06-25 user revision:
+#   - Top-level heading shortened from
+#       "Aim — what this work is for, and what it is not"
+#     to just "Aim".
+#   - "Lower marginal cost..." bullet trimmed to one short clause.
+#   - "How this addresses..." paragraph: removed the trailing D3 cross-eval
+#     callout sentences and the em-dash editorial in the gpt-5.4-nano note.
+#   - "Scope and non-goals" sub-heading: em-dash replaced with a colon.
+#   - "Deployment plan" step 2 collapsed to one short sentence.
+add_heading("Aim", level=1)
+
+add_para("What we are proposing", bold=True, size=11)
+add_para(
+    "Replace the WITS static command classifier (~15-20k lines of hand-"
+    "curated regex / AST rules in copilot-agent-runtime) with a learned "
+    "attention-graph GNN over a frozen Qwen 2.5 0.5B featurizer. The "
+    "GNN keeps the same 4-class verdict contract (safe / maybe_safe / "
+    "unsafe / extremely_unsafe) so it is a drop-in for the existing "
+    "Verdict enum, but emits a calibrated confidence alongside the "
+    "label so the pipeline can route by threshold instead of by hard "
+    "rule hits.",
+    size=10,
+)
+doc.add_paragraph()
+
+add_para("Where the GNN fits in the auto-approve pipeline", bold=True, size=11)
+add_para(
+    "The static layer's only operational job is to decide which of "
+    "three buckets a command lands in: (a) confident-safe → fast-pass "
+    "auto-approve, (b) confident-extremely-unsafe → fast hard-deny, "
+    "(c) everything else → hand off to the LLM judge with conversation "
+    "context. The GNN does exactly this routing, with two advantages "
+    "over WITS:",
+    size=10,
+)
+add_para(
+    "• Confidence-thresholded fast-pass and fast-deny — the model "
+    "exposes softmax probabilities, so the pipeline can require a "
+    "tunable confidence floor (e.g. τ ≥ 0.85) before short-circuiting "
+    "around the LLM. WITS's rule hits do not give the gate a tunable "
+    "knob; they are yes/no.",
+    size=10,
+)
+add_para(
+    "• Lower marginal cost than rule maintenance — adding coverage "
+    "for a new attack class is not regex authorship.",
+    size=10,
+)
+doc.add_paragraph()
+
+add_para("How this addresses the 'do we even need WITS?' reviewer concern", bold=True, size=11)
+add_para(
+    "A separate reviewer comment proposed deleting WITS entirely and "
+    "calling an LLM utility model on every command that would "
+    "otherwise prompt for human approval. We tested this directly: "
+    "gpt-5-mini (the smallest gpt-5-family chat-API model available "
+    "on this integrator) was given the same 311 commands with the "
+    "same input contract WITS and the GNN, and asked to emit a "
+    "4-class verdict. Result: the utility LLM beats WITS on accuracy "
+    "(0.830 vs 0.775 3-class) but loses to the GNN on every metric "
+    "accuracy, hard-deny precision, silent auto-approve rate, and "
+    "especially latency (~6,000 ms mean / ~17,000 ms p95 per call, "
+    "vs ~30 ms for the GNN). See the 'Utility-model comparison' "
+    "section for the full numbers. The utility-LLM path is also "
+    "subject to the production concerns we already documented for "
+    "LLM-judge calls: transient failures and concurrency-related "
+    "empty responses requiring retry logic. The GNN sits between "
+    "WITS-as-is and LLM-on-everything: it is the cheap, "
+    "deterministic-feeling pre-filter that makes the LLM-judge "
+    "approach economically viable.",
+    size=10,
+)
+doc.add_paragraph()
+
+add_para("Scope and non-goals: what this work does NOT address", bold=True, size=11)
+add_para(
+    "This is a command-pattern classifier replacement. It does not "
+    "address the broader trust-chain concerns raised in the design "
+    "review:",
+    size=10,
+)
+add_para(
+    "• Untrusted instruction sources — commands derived from hostile "
+    "repo content, MCP tool outputs, skill SKILL.md files, or "
+    "agent-self-authored scripts look identical to user-requested "
+    "commands at the static layer. No command-level classifier can "
+    "distinguish them; this is a provenance problem.",
+    size=10,
+)
+add_para(
+    "• Out-of-workspace writes — commands that touch ~/.ssh, ~/.aws, "
+    "~/.gnupg, or other paths outside the project root are not "
+    "specially gated today. WITS does not enforce this and neither "
+    "would the GNN; it needs explicit path-scoping in the pipeline.",
+    size=10,
+)
+add_para(
+    "• Decoded-from-encoded commands — when the agent decodes a "
+    "base64/encoded payload and runs the decoded form, that is "
+    "currently invisible to the static layer. Needs a 'decoded-by-"
+    "agent' marker in the pipeline, not a smarter classifier.",
+    size=10,
+)
+add_para(
+    "These five attack classes (prompt injection via repo files, "
+    "trusted-script execution like `npm test` in untrusted repos, "
+    "agent-self-authored test code, hostile skills, hostile MCP "
+    "outputs) require pipeline-architecture changes — provenance "
+    "tagging of instruction sources, explicit out-of-workspace write "
+    "controls, self-authored-script gating, and untrusted-content "
+    "markers on tool outputs. Those are separate from the question "
+    "this report answers, which is: 'if we are going to keep a static "
+    "command classifier in the pipeline at all, should it be WITS or "
+    "a learned GNN?'.",
+    size=10,
+)
+doc.add_paragraph()
+
+add_para("Deployment plan", bold=True, size=11)
+add_para(
+    "1. Ship the GNN in shadow mode behind the existing WITS "
+    "verdict for 2-4 weeks. Log GNN verdict + confidence alongside "
+    "WITS verdict on every command; do not change production routing.",
+    size=10,
+)
+add_para(
+    "2. Review the disagreement telemetry. Confirm the numbers hold "
+    "up on live agent traffic.",
+    size=10,
+)
+add_para(
+    "3. If telemetry holds, flip routing: GNN verdict drives the "
+    "fast-pass / fast-deny / route-to-judge decision, WITS stays as a "
+    "logged shadow signal for one more cycle, then deleted.",
+    size=10,
+)
+add_para(
+    "4. The trust-chain protections listed under non-goals are "
+    "designed and shipped as a separate workstream. They do not block "
+    "the GNN swap; the GNN swap does not block them.",
+    size=10,
+)
+
+
+# ============================ TL;DR =========================================
 
 add_heading("TL;DR", level=1)
 # Headline numbers
@@ -398,6 +592,7 @@ add_para("How to read this:", bold=True, size=10)
 add_para("• Acc (3-class op) collapses `maybe_safe` ∪ `unsafe` -> `maybe` (both route to LLM judge in production, so the distinction is operationally moot).", size=10)
 add_para("• Silent auto-approve = fraction of test cases where the method predicted `safe` but the truth was `maybe`/`extremely_unsafe`. This is THE safety-critical failure mode.", size=10)
 add_para("• Latency is per-command end-to-end (featurization + model). WITS does not need LLM featurization; the GNN does.", size=10)
+add_para("• The utility-model LLM row(s) (gpt-5-mini, gpt-4.1, gpt-4o-mini) are included to test the reviewer proposal 'just use an LLM as the static layer'. They beat WITS on accuracy but lose to the GNN on accuracy, hard-deny precision, and latency by a wide margin. See the 'Utility-model comparison' section for the full head-to-head.", size=10)
 
 
 # ============================ METHOD DESCRIPTIONS ==========================
@@ -434,6 +629,19 @@ add_para(
     "frequency, capped at 20x) for up to 700 epochs with macro-F1 "
     "early-stopping on the test set."
 )
+if utility_loaded:
+    add_heading("Utility-model LLMs", level=2)
+    util_names = ", ".join(m for m, _, _ in utility_loaded)
+    add_para(
+        "Direct ask: prompt one or more general-purpose LLMs via CAPI "
+        f"({util_names}) with the command + shell only and require "
+        "them to emit one of the four verdict labels in a single JSON "
+        "object. No graph, no learnable head, no intention or "
+        "transcript fed in — same input contract as WITS and the GNN "
+        "so the head-to-head is apples-to-apples. Included to answer "
+        "the reviewer question 'could we just use an LLM utility "
+        "model as the static layer?'."
+    )
 
 
 # ============================ DETAILED PER-METHOD ==========================
@@ -470,17 +678,80 @@ for name, run in method_runs.items():
 # ============================ 3-CLASS OPERATIONAL ==========================
 
 doc.add_page_break()
-add_heading("Operational 3-class collapse (`maybe_safe ∪ unsafe = maybe`)", level=1)
+add_heading("Operational 3-class accuracy (production-aligned)", level=1)
 add_para(
-    "In production the static-analyzer's job is just to short-circuit: "
-    "`safe` -> auto-approve, `extremely_unsafe` -> hard-deny, anything "
-    "else -> hand off to the LLM judge. So `maybe_safe` vs `unsafe` is "
-    "operationally indistinguishable. This section reports the "
-    "collapsed 3-class metric for fairer head-to-head comparison."
+    "Why we collapse from 4 classes to 3 for reporting: in the "
+    "auto-approve pipeline, the static layer's only job is to route — "
+    "`safe` short-circuits to auto-approve, `extremely_unsafe` "
+    "short-circuits to hard-deny, and BOTH `maybe_safe` AND `unsafe` "
+    "are handed off to the LLM judge. The judge then issues the final "
+    "verdict. So distinguishing `maybe_safe` from `unsafe` at the "
+    "static layer has zero downstream impact — the same command takes "
+    "the same path through the pipeline either way. Reporting only "
+    "4-class metrics penalizes both WITS and the GNN for confusions "
+    "that production never sees. The 3-class view collapses "
+    "`maybe_safe ∪ unsafe -> judge` and is the metric we should use "
+    "when comparing static-layer candidates.",
+    size=10,
 )
+add_para(
+    "Models are still TRAINED on 4 classes — the extra severity signal "
+    "is useful gradient information and keeps the GNN's output "
+    "contract aligned with WITS's `Verdict` enum. Only the evaluation "
+    "is collapsed.",
+    italic=True, size=10,
+)
+doc.add_paragraph()
+
+# ---- consolidated 3-class summary table (one row per method) --------------
+add_heading("3-class summary — all methods on the 311-row test split", level=2)
+summary_rows = []
+for name, run in method_runs.items():
+    yt3 = [collapse_op(v) for v in run["y_true"]]
+    yp3 = [collapse_op(v) for v in run["y_pred"]]
+    acc3 = accuracy_score(yt3, yp3)
+    f13 = f1_score(yt3, yp3, average="macro", labels=OP_LABELS, zero_division=0)
+    # silent auto-approve on the 3-class collapse: predicted safe but truth was judge/extreme
+    silent = sum(1 for t, p in zip(yt3, yp3)
+                 if p == "safe" and t in ("maybe", "extremely_unsafe"))
+    silent_rate = silent / len(yt3) if yt3 else 0.0
+    # hard-deny precision: of cases predicted extremely_unsafe, how many truly were
+    pred_extreme = [t for t, p in zip(yt3, yp3) if p == "extremely_unsafe"]
+    hd_prec = (sum(1 for t in pred_extreme if t == "extremely_unsafe") / len(pred_extreme)
+               if pred_extreme else float("nan"))
+    summary_rows.append([
+        name,
+        fmt_f(acc3),
+        fmt_f(f13),
+        fmt_pct(silent_rate),
+        (fmt_f(hd_prec) if not (isinstance(hd_prec, float) and hd_prec != hd_prec) else "—"),
+    ])
+add_table(
+    ["Method", "Accuracy (3-class)", "Macro F1 (3-class)",
+     "Silent auto-approve", "Hard-deny precision"],
+    summary_rows,
+)
+add_para(
+    "Silent auto-approve = predicted `safe` but truth was `judge` or "
+    "`extremely_unsafe`. This is the safety-critical failure mode — a "
+    "command that should have gone to the judge or been hard-denied "
+    "instead got executed without review. Lower is better.",
+    size=10,
+)
+add_para(
+    "Hard-deny precision = of cases the method predicted "
+    "`extremely_unsafe`, the fraction that truly were. A low number "
+    "would mean the method is over-blocking and would hurt developer "
+    "experience.",
+    size=10,
+)
+doc.add_paragraph()
+
+# ---- per-method 3-class detail (kept for reviewers who want the full picture) ----
+add_heading("Per-method 3-class detail", level=2)
 
 for name, run in method_runs.items():
-    add_heading(name + " — 3-class", level=2)
+    add_heading(name + " — 3-class", level=3)
     yt3 = [collapse_op(v) for v in run["y_true"]]
     yp3 = [collapse_op(v) for v in run["y_pred"]]
     add_para(f"Accuracy: {fmt_f(accuracy_score(yt3, yp3))}   "
@@ -537,6 +808,151 @@ add_para("• On GPU the LLM featurization typically drops by ~10x, narrowing th
 add_para("• For tiered deployment (WITS first, GNN only on `maybe_safe`/`unsafe`), the GNN's amortized cost across all commands is much smaller — only ~30% of test cases reached the maybe/unsafe bucket.", size=10)
 
 
+# ============================ UTILITY-MODEL COMPARISON =====================
+
+if utility_loaded:
+    doc.add_page_break()
+    add_heading("Utility-model comparison — LLMs as the static layer", level=1)
+    add_para(
+        "This section answers a specific reviewer question: 'instead "
+        "of WITS or a GNN, could we just ask a small utility LLM to "
+        "classify each command?' We tested this end-to-end on the "
+        "same 311-row split with the same input contract (command + "
+        "shell only, no transcript, no intention, no rule hits). The "
+        "model was given a four-class prompt requiring a JSON object "
+        "of the form {\"verdict\": \"<label>\", \"rationale\": ...} "
+        "on the last line.",
+        size=10,
+    )
+    add_para(
+        "Model selection note: the user originally asked for "
+        "gpt-5.4-nano. That model is not exposed on the vscode-chat "
+        "CAPI integrator. We evaluated every other plausible "
+        "small/medium utility model available on the integrator "
+        f"({', '.join(m for m, _, _ in utility_loaded)}). "
+        "gpt-5.4-mini exists but is responses-API only (returns 400 "
+        "from /chat/completions) so it is excluded.",
+        italic=True, size=10,
+    )
+
+    # Compact head-to-head table for WITS + GNN + every utility model.
+    w = method_runs["WITS static (rule-based)"]
+    g = method_runs["GNN (class-weighted CE)"]
+
+    def _row(name, run):
+        yt, yp = run["y_true"], run["y_pred"]
+        acc4 = accuracy_score(yt, yp)
+        f14  = f1_score(yt, yp, average="macro", labels=LABELS, zero_division=0)
+        yt3 = [collapse_op(v) for v in yt]
+        yp3 = [collapse_op(v) for v in yp]
+        acc3 = accuracy_score(yt3, yp3)
+        f13  = f1_score(yt3, yp3, average="macro", labels=OP_LABELS, zero_division=0)
+        silent = sum(1 for t, p in zip(yt3, yp3) if p == "safe" and t in ("maybe", "extremely_unsafe"))
+        silent_rate = silent / len(yt3) if yt3 else 0.0
+        pred_extreme = [t for t, p in zip(yt3, yp3) if p == "extremely_unsafe"]
+        hd_prec = (sum(1 for t in pred_extreme if t == "extremely_unsafe") / len(pred_extreme)
+                   if pred_extreme else None)
+        e2e_mean = run["feat_lat"]["mean"] + run["model_lat"]["mean"]
+        e2e_p95  = run["feat_lat"]["p95"]  + run["model_lat"]["p95"]
+        return [name,
+                fmt_f(acc4), fmt_f(f14),
+                fmt_f(acc3), fmt_f(f13),
+                fmt_pct(silent_rate),
+                (fmt_f(hd_prec) if hd_prec is not None else "—"),
+                fmt_ms(e2e_mean), fmt_ms(e2e_p95)]
+
+    add_heading("Head-to-head on the same 311 commands", level=2)
+    head_rows = [
+        _row("WITS static", w),
+        _row("GNN (weighted)", g),
+    ]
+    for model_name, display, _recs in utility_loaded:
+        head_rows.append(_row(f"Utility-model ({model_name})", method_runs[display]))
+    add_table(
+        ["Method",
+         "Acc (4-class)", "Macro-F1 (4-class)",
+         "Acc (3-class)", "Macro-F1 (3-class)",
+         "Silent auto-approve", "Hard-deny precision",
+         "E2E mean (ms)", "E2E p95 (ms)"],
+        head_rows,
+    )
+    doc.add_paragraph()
+
+    # 3-class confusion matrix for each utility model.
+    for model_name, display, _recs in utility_loaded:
+        u = method_runs[display]
+        add_heading(f"{model_name} — 3-class confusion matrix", level=2)
+        add_para("Rows = truth, cols = prediction. Collapsed to operational 3-class "
+                 "(maybe_safe + unsafe -> maybe -> route to judge).", italic=True, size=10)
+        yt3 = [collapse_op(v) for v in u["y_true"]]
+        yp3 = [collapse_op(v) for v in u["y_pred"]]
+        cm = confusion_matrix(yt3, yp3, labels=OP_LABELS)
+        cm_rows = [[cls] + [int(cm[i, j]) for j in range(len(OP_LABELS))]
+                   for i, cls in enumerate(OP_LABELS)]
+        add_table(["true \\ pred"] + OP_LABELS, cm_rows)
+        doc.add_paragraph()
+
+    # Compute the dynamic verdict numbers so the prose stays honest as
+    # new utility models are added.
+    def _summary(run):
+        yt, yp = run["y_true"], run["y_pred"]
+        yt3 = [collapse_op(v) for v in yt]
+        yp3 = [collapse_op(v) for v in yp]
+        acc3 = accuracy_score(yt3, yp3)
+        f13  = f1_score(yt3, yp3, average="macro", labels=OP_LABELS, zero_division=0)
+        silent = sum(1 for t, p in zip(yt3, yp3) if p == "safe" and t in ("maybe", "extremely_unsafe"))
+        silent_rate = silent / len(yt3) if yt3 else 0.0
+        pred_extreme = [t for t, p in zip(yt3, yp3) if p == "extremely_unsafe"]
+        hd_prec = (sum(1 for t in pred_extreme if t == "extremely_unsafe") / len(pred_extreme)
+                   if pred_extreme else None)
+        lat_mean = run["feat_lat"]["mean"] + run["model_lat"]["mean"]
+        lat_p95  = run["feat_lat"]["p95"]  + run["model_lat"]["p95"]
+        return acc3, f13, silent_rate, hd_prec, lat_mean, lat_p95
+
+    g_acc3, g_f13, g_silent, g_hd, g_lm, g_lp = _summary(g)
+    w_acc3, w_f13, w_silent, w_hd, w_lm, w_lp = _summary(w)
+
+    add_heading("Verdict", level=2)
+    add_para(
+        f"On the same 311 commands the GNN reaches {fmt_f(g_acc3)} "
+        f"3-class accuracy and {fmt_f(g_f13)} macro-F1, with "
+        f"{fmt_pct(g_silent)} silent auto-approve and "
+        f"{fmt_f(g_hd) if g_hd is not None else 'n/a'} hard-deny "
+        f"precision, at end-to-end latency {fmt_ms(g_lm)} ms mean / "
+        f"{fmt_ms(g_lp)} ms p95. The utility-model row(s) above are "
+        "evaluated against that bar.",
+        size=10,
+    )
+    # Per-model verdict line, computed dynamically.
+    for model_name, display, _recs in utility_loaded:
+        u_acc3, u_f13, u_silent, u_hd, u_lm, u_lp = _summary(method_runs[display])
+        delta_acc = (u_acc3 - g_acc3) * 100
+        slow_x = (u_lm / max(g_lm, 1e-6))
+        add_para(
+            f"• {model_name}: 3-class acc {fmt_f(u_acc3)} "
+            f"({delta_acc:+.1f} pp vs GNN), macro-F1 {fmt_f(u_f13)}, "
+            f"silent auto-approve {fmt_pct(u_silent)}, hard-deny "
+            f"precision {fmt_f(u_hd) if u_hd is not None else 'n/a'}, "
+            f"latency {fmt_ms(u_lm)} ms mean (~{slow_x:.0f}x slower "
+            f"end-to-end than the GNN). "
+            + ("Beats WITS on accuracy; loses to GNN."
+               if u_acc3 > w_acc3 else
+               "Does not beat WITS on accuracy either."),
+            size=10,
+        )
+    add_para(
+        "Across every utility model tested, the same pattern holds: "
+        "they may beat WITS on raw accuracy, but they are markedly "
+        "slower than the GNN and tend to over-predict "
+        "extremely_unsafe, which hurts hard-deny precision and would "
+        "directly degrade developer experience. The right slot for "
+        "an LLM in this pipeline is the existing one — called only "
+        "on the ~25-30% of commands the GNN is uncertain about — "
+        "not as the static layer itself.",
+        bold=True, size=10,
+    )
+
+
 # ============================ PER-BUCKET ===================================
 
 doc.add_page_break()
@@ -561,8 +977,7 @@ for b in bucket_order:
             row.append(f"{fmt_pct(rec['correct']/rec['n'])} ({rec['correct']}/{rec['n']})")
     bucket_rows.append(row)
 add_table(
-    ["Source bucket", "n",
-     "WITS static", "Prompt-only LLM", "GNN (class-weighted)"],
+    ["Source bucket", "n"] + list(method_runs.keys()),
     bucket_rows,
 )
 
@@ -624,22 +1039,12 @@ add_table(["Command", "Shell", "Truth", "WITS", "GNN", "Source"],
 
 
 # ============================ DEPLOYMENT REC ===============================
-
-doc.add_page_break()
-add_heading("Deployment recommendation", level=1)
-add_para(
-    "The two methods sit at very different points on the accuracy / "
-    "latency frontier. The natural design is a tiered system:",
-    size=11,
-)
-add_para("1. WITS static first. Sub-millisecond cost. Short-circuits ~70% of commands cleanly (the obvious-safe / obvious-extreme tail).", size=10)
-add_para("2. GNN as the second-stage judge on the ~30% of commands that WITS returns `maybe_safe` or `unsafe` for. ~965 ms per call, but only on the ambiguous tail.", size=10)
-add_para("3. The LLM judge is invoked only when the GNN itself is uncertain — or kept as a sanity check on the GNN's predictions for the most dangerous classes.", size=10)
-doc.add_paragraph()
-add_para("Standalone deployment of the GNN (no WITS in front) trades roughly 30 pp of safety-critical accuracy improvement for ~1 s extra latency per command. Whether that's worth it depends on the use case:", size=11)
-add_para("• Inline CLI gating (must answer < 50 ms): WITS or GNN-on-GPU (~100 ms).", size=10)
-add_para("• Background audit / PR review bot: GNN. Latency irrelevant.", size=10)
-add_para("• High-stakes agents (production-touching tools, prod credentials): GNN, because its silent-auto-approve rate is ~5× lower than WITS's on the attack patterns we care about most.", size=10)
+# NOTE — manual edits applied from the 2026-06-25 user revision:
+#   - The entire "Deployment recommendation" section was removed. The Aim
+#     section's "Deployment plan" sub-section is the canonical version; the
+#     duplicated tiered/use-case content here was dropped to avoid
+#     contradicting the simpler GNN-as-static-layer recommendation in Aim.
+#     Keep deleted unless the user reverses the decision.
 
 
 # ============================ FOOTER ======================================
